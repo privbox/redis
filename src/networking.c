@@ -35,6 +35,10 @@
 #include <math.h>
 #include <ctype.h>
 
+#ifdef KERNCALL
+#include <sys/kerncall.h>
+#endif
+
 static void setProtocolError(const char *errstr, client *c);
 int postponeClientRead(client *c);
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
@@ -1036,15 +1040,10 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
      * Admission control will happen before a client is created and connAccept()
      * called, because we don't want to even start transport-level negotiation
      * if rejected. */
-    if (listLength(server.clients) + getClusterConnectionsCount()
-        >= server.maxclients)
+    if (listLength(server.clients) >= server.maxclients)
     {
         char *err;
-        if (server.cluster_enabled)
-            err = "-ERR max number of clients + cluster "
-                  "connections reached\r\n";
-        else
-            err = "-ERR max number of clients reached\r\n";
+        err = "-ERR max number of clients reached\r\n";
 
         /* That's a best effort error message, don't check write errors.
          * Note that for TLS connections, no handshake was done yet so nothing
@@ -1630,7 +1629,7 @@ void resetClient(client *c) {
 
     /* We clear the ASKING flag as well if we are not inside a MULTI, and
      * if what we just executed is not the ASKING command itself. */
-    if (!(c->flags & CLIENT_MULTI) && prevcmd != askingCommand)
+    if (!(c->flags & CLIENT_MULTI))
         c->flags &= ~CLIENT_ASKING;
 
     /* We do the same for the CACHING command as well. It also affects
@@ -2031,12 +2030,6 @@ void processInputBuffer(client *c) {
         /* Don't process more buffers from clients that have already pending
          * commands to execute in c->argv. */
         if (c->flags & CLIENT_PENDING_COMMAND) break;
-
-        /* Don't process input from the master while there is a busy script
-         * condition on the slave. We want just to accumulate the replication
-         * stream (instead of replying -BUSY like we do with other clients) and
-         * later resume the processing. */
-        if (server.lua_timedout && c->flags & CLIENT_MASTER) break;
 
         /* CLIENT_CLOSE_AFTER_REPLY closes the connection once the reply is
          * written to the client. Make sure to not let the reply grow after
@@ -2966,7 +2959,7 @@ void helloCommand(client *c) {
 
     /* Let's switch to the specified RESP mode. */
     if (ver) c->resp = ver;
-    addReplyMapLen(c,6 + !server.sentinel_mode);
+    addReplyMapLen(c,6 + 1);
 
     addReplyBulkCString(c,"server");
     addReplyBulkCString(c,"redis");
@@ -2981,14 +2974,12 @@ void helloCommand(client *c) {
     addReplyLongLong(c,c->id);
 
     addReplyBulkCString(c,"mode");
-    if (server.sentinel_mode) addReplyBulkCString(c,"sentinel");
-    else if (server.cluster_enabled) addReplyBulkCString(c,"cluster");
+    if (server.cluster_enabled) addReplyBulkCString(c,"cluster");
     else addReplyBulkCString(c,"standalone");
 
-    if (!server.sentinel_mode) {
-        addReplyBulkCString(c,"role");
-        addReplyBulkCString(c,server.masterhost ? "replica" : "master");
-    }
+    addReplyBulkCString(c,"role");
+    addReplyBulkCString(c,server.masterhost ? "replica" : "master");
+
 
     addReplyBulkCString(c,"modules");
     addReplyLoadedModules(c);
@@ -3381,11 +3372,30 @@ static inline void setIOPendingCount(int i, unsigned long count) {
     atomicSetWithSync(io_threads_pending[i], count);
 }
 
+void handleIoList(listIter *li) {
+    listNode *ln;
+    while((ln = listNext(li))) {
+        client *c = listNodeValue(ln);
+        if (io_threads_op == IO_THREADS_OP_WRITE) {
+            // serverLog(LL_WARNING, "io thread write");
+            writeToClient(c,0);
+        } else if (io_threads_op == IO_THREADS_OP_READ) {
+            // serverLog(LL_WARNING, "io thread read");
+            readQueryFromClient(c->conn);
+        } else {
+            serverPanic("io_threads_op value is unknown");
+        }
+    }
+}
+
 void *IOThreadMain(void *myid) {
     /* The ID is the thread number (from 0 to server.iothreads_num-1), and is
      * used by the thread to just manipulate a single sub-array of clients. */
     long id = (unsigned long)myid;
     char thdname[16];
+    unsigned long cs;
+    __asm__ ("mov %%cs, %0" : "=r"(cs));
+    serverLog(LL_NOTICE, "in IOThreadMain - %ld, cs %lx", id, cs);
 
     snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
     redis_set_thread_title(thdname);
@@ -3414,20 +3424,14 @@ void *IOThreadMain(void *myid) {
         listIter li;
         listNode *ln;
         listRewind(io_threads_list[id],&li);
-        while((ln = listNext(&li))) {
-            client *c = listNodeValue(ln);
-            if (io_threads_op == IO_THREADS_OP_WRITE) {
-                writeToClient(c,0);
-            } else if (io_threads_op == IO_THREADS_OP_READ) {
-                readQueryFromClient(c->conn);
-            } else {
-                serverPanic("io_threads_op value is unknown");
-            }
-        }
+#ifdef KERNCALL
+        if (server.use_kerncall)
+            kerncall_spawn((uintptr_t)handleIoList, (unsigned long) &li);
+        else
+#endif
+            handleIoList(&li);
         listEmpty(io_threads_list[id]);
         setIOPendingCount(id, 0);
-
-        if (tio_debug) printf("[%ld] Done\n", id);
     }
 }
 

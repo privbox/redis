@@ -678,37 +678,6 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
     if (cmd->flags & CMD_RANDOM) server.lua_random_dirty = 1;
     if (cmd->flags & CMD_WRITE) server.lua_write_dirty = 1;
 
-    /* If this is a Redis Cluster node, we need to make sure Lua is not
-     * trying to access non-local keys, with the exception of commands
-     * received from our master or when loading the AOF back in memory. */
-    if (server.cluster_enabled && !server.loading &&
-        !(server.lua_caller->flags & CLIENT_MASTER))
-    {
-        int error_code;
-        /* Duplicate relevant flags in the lua client. */
-        c->flags &= ~(CLIENT_READONLY|CLIENT_ASKING);
-        c->flags |= server.lua_caller->flags & (CLIENT_READONLY|CLIENT_ASKING);
-        if (getNodeByQuery(c,c->cmd,c->argv,c->argc,NULL,&error_code) !=
-                           server.cluster->myself)
-        {
-            if (error_code == CLUSTER_REDIR_DOWN_RO_STATE) {
-                luaPushError(lua,
-                    "Lua script attempted to execute a write command while the "
-                    "cluster is down and readonly");
-            } else if (error_code == CLUSTER_REDIR_DOWN_STATE) {
-                luaPushError(lua,
-                    "Lua script attempted to execute a command while the "
-                    "cluster is down");
-            } else {
-                luaPushError(lua,
-                    "Lua script attempted to access a non local key in a "
-                    "cluster node");
-            }
-
-            goto cleanup;
-        }
-    }
-
     /* If we are using single commands replication, we need to wrap what
      * we propagate into a MULTI/EXEC block, so that it will be atomic like
      * a Lua script in the context of AOF and slaves. */

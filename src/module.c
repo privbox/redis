@@ -1616,7 +1616,7 @@ int RM_ReplyWithLongDouble(RedisModuleCtx *ctx, long double ld) {
 void moduleReplicateMultiIfNeeded(RedisModuleCtx *ctx) {
     /* Skip this if client explicitly wrap the command with MULTI, or if
      * the module command was called by a script. */
-    if (server.lua_caller || server.in_exec) return;
+    if (server.in_exec) return;
     /* If we already emitted MULTI return ASAP. */
     if (server.propagate_in_transaction) return;
     /* If this is a thread safe context, we do not want to wrap commands
@@ -1867,8 +1867,6 @@ int RM_GetClientInfoById(void *ci, uint64_t id) {
 int RM_PublishMessage(RedisModuleCtx *ctx, RedisModuleString *channel, RedisModuleString *message) {
     UNUSED(ctx);
     int receivers = pubsubPublishMessage(channel, message);
-    if (server.cluster_enabled)
-        clusterPropagatePublish(channel, message);
     return receivers;
 }
 
@@ -3433,28 +3431,6 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     if ((cmd->arity > 0 && cmd->arity != argc) || (argc < -cmd->arity)) {
         errno = EINVAL;
         goto cleanup;
-    }
-
-    /* If this is a Redis Cluster node, we need to make sure the module is not
-     * trying to access non-local keys, with the exception of commands
-     * received from our master. */
-    if (server.cluster_enabled && !(ctx->client->flags & CLIENT_MASTER)) {
-        int error_code;
-        /* Duplicate relevant flags in the module client. */
-        c->flags &= ~(CLIENT_READONLY|CLIENT_ASKING);
-        c->flags |= ctx->client->flags & (CLIENT_READONLY|CLIENT_ASKING);
-        if (getNodeByQuery(c,c->cmd,c->argv,c->argc,NULL,&error_code) !=
-                           server.cluster->myself)
-        {
-            if (error_code == CLUSTER_REDIR_DOWN_RO_STATE) { 
-                errno = EROFS;
-            } else if (error_code == CLUSTER_REDIR_DOWN_STATE) { 
-                errno = ENETDOWN;
-            } else {
-                errno = EPERM;
-            }
-            goto cleanup;
-        }
     }
 
     /* If we are using single commands replication, we need to wrap what
@@ -5196,262 +5172,6 @@ void moduleUnsubscribeNotifications(RedisModule *module) {
             zfree(sub);
         }
     }
-}
-
-/* --------------------------------------------------------------------------
- * Modules Cluster API
- * -------------------------------------------------------------------------- */
-
-/* The Cluster message callback function pointer type. */
-typedef void (*RedisModuleClusterMessageReceiver)(RedisModuleCtx *ctx, const char *sender_id, uint8_t type, const unsigned char *payload, uint32_t len);
-
-/* This structure identifies a registered caller: it must match a given module
- * ID, for a given message type. The callback function is just the function
- * that was registered as receiver. */
-typedef struct moduleClusterReceiver {
-    uint64_t module_id;
-    RedisModuleClusterMessageReceiver callback;
-    struct RedisModule *module;
-    struct moduleClusterReceiver *next;
-} moduleClusterReceiver;
-
-typedef struct moduleClusterNodeInfo {
-    int flags;
-    char ip[NET_IP_STR_LEN];
-    int port;
-    char master_id[40]; /* Only if flags & REDISMODULE_NODE_MASTER is true. */
-} mdouleClusterNodeInfo;
-
-/* We have an array of message types: each bucket is a linked list of
- * configured receivers. */
-static moduleClusterReceiver *clusterReceivers[UINT8_MAX];
-
-/* Dispatch the message to the right module receiver. */
-void moduleCallClusterReceivers(const char *sender_id, uint64_t module_id, uint8_t type, const unsigned char *payload, uint32_t len) {
-    moduleClusterReceiver *r = clusterReceivers[type];
-    while(r) {
-        if (r->module_id == module_id) {
-            RedisModuleCtx ctx = REDISMODULE_CTX_INIT;
-            ctx.module = r->module;
-            ctx.client = moduleFreeContextReusedClient;
-            selectDb(ctx.client, 0);
-            r->callback(&ctx,sender_id,type,payload,len);
-            moduleFreeContext(&ctx);
-            return;
-        }
-        r = r->next;
-    }
-}
-
-/* Register a callback receiver for cluster messages of type 'type'. If there
- * was already a registered callback, this will replace the callback function
- * with the one provided, otherwise if the callback is set to NULL and there
- * is already a callback for this function, the callback is unregistered
- * (so this API call is also used in order to delete the receiver). */
-void RM_RegisterClusterMessageReceiver(RedisModuleCtx *ctx, uint8_t type, RedisModuleClusterMessageReceiver callback) {
-    if (!server.cluster_enabled) return;
-
-    uint64_t module_id = moduleTypeEncodeId(ctx->module->name,0);
-    moduleClusterReceiver *r = clusterReceivers[type], *prev = NULL;
-    while(r) {
-        if (r->module_id == module_id) {
-            /* Found! Set or delete. */
-            if (callback) {
-                r->callback = callback;
-            } else {
-                /* Delete the receiver entry if the user is setting
-                 * it to NULL. Just unlink the receiver node from the
-                 * linked list. */
-                if (prev)
-                    prev->next = r->next;
-                else
-                    clusterReceivers[type]->next = r->next;
-                zfree(r);
-            }
-            return;
-        }
-        prev = r;
-        r = r->next;
-    }
-
-    /* Not found, let's add it. */
-    if (callback) {
-        r = zmalloc(sizeof(*r));
-        r->module_id = module_id;
-        r->module = ctx->module;
-        r->callback = callback;
-        r->next = clusterReceivers[type];
-        clusterReceivers[type] = r;
-    }
-}
-
-/* Send a message to all the nodes in the cluster if `target` is NULL, otherwise
- * at the specified target, which is a REDISMODULE_NODE_ID_LEN bytes node ID, as
- * returned by the receiver callback or by the nodes iteration functions.
- *
- * The function returns REDISMODULE_OK if the message was successfully sent,
- * otherwise if the node is not connected or such node ID does not map to any
- * known cluster node, REDISMODULE_ERR is returned. */
-int RM_SendClusterMessage(RedisModuleCtx *ctx, char *target_id, uint8_t type, unsigned char *msg, uint32_t len) {
-    if (!server.cluster_enabled) return REDISMODULE_ERR;
-    uint64_t module_id = moduleTypeEncodeId(ctx->module->name,0);
-    if (clusterSendModuleMessageToTarget(target_id,module_id,type,msg,len) == C_OK)
-        return REDISMODULE_OK;
-    else
-        return REDISMODULE_ERR;
-}
-
-/* Return an array of string pointers, each string pointer points to a cluster
- * node ID of exactly REDISMODULE_NODE_ID_SIZE bytes (without any null term).
- * The number of returned node IDs is stored into `*numnodes`.
- * However if this function is called by a module not running an a Redis
- * instance with Redis Cluster enabled, NULL is returned instead.
- *
- * The IDs returned can be used with RedisModule_GetClusterNodeInfo() in order
- * to get more information about single nodes.
- *
- * The array returned by this function must be freed using the function
- * RedisModule_FreeClusterNodesList().
- *
- * Example:
- *
- *     size_t count, j;
- *     char **ids = RedisModule_GetClusterNodesList(ctx,&count);
- *     for (j = 0; j < count; j++) {
- *         RedisModule_Log("notice","Node %.*s",
- *             REDISMODULE_NODE_ID_LEN,ids[j]);
- *     }
- *     RedisModule_FreeClusterNodesList(ids);
- */
-char **RM_GetClusterNodesList(RedisModuleCtx *ctx, size_t *numnodes) {
-    UNUSED(ctx);
-
-    if (!server.cluster_enabled) return NULL;
-    size_t count = dictSize(server.cluster->nodes);
-    char **ids = zmalloc((count+1)*REDISMODULE_NODE_ID_LEN);
-    dictIterator *di = dictGetIterator(server.cluster->nodes);
-    dictEntry *de;
-    int j = 0;
-    while((de = dictNext(di)) != NULL) {
-        clusterNode *node = dictGetVal(de);
-        if (node->flags & (CLUSTER_NODE_NOADDR|CLUSTER_NODE_HANDSHAKE)) continue;
-        ids[j] = zmalloc(REDISMODULE_NODE_ID_LEN);
-        memcpy(ids[j],node->name,REDISMODULE_NODE_ID_LEN);
-        j++;
-    }
-    *numnodes = j;
-    ids[j] = NULL; /* Null term so that FreeClusterNodesList does not need
-                    * to also get the count argument. */
-    dictReleaseIterator(di);
-    return ids;
-}
-
-/* Free the node list obtained with RedisModule_GetClusterNodesList. */
-void RM_FreeClusterNodesList(char **ids) {
-    if (ids == NULL) return;
-    for (int j = 0; ids[j]; j++) zfree(ids[j]);
-    zfree(ids);
-}
-
-/* Return this node ID (REDISMODULE_CLUSTER_ID_LEN bytes) or NULL if the cluster
- * is disabled. */
-const char *RM_GetMyClusterID(void) {
-    if (!server.cluster_enabled) return NULL;
-    return server.cluster->myself->name;
-}
-
-/* Return the number of nodes in the cluster, regardless of their state
- * (handshake, noaddress, ...) so that the number of active nodes may actually
- * be smaller, but not greater than this number. If the instance is not in
- * cluster mode, zero is returned. */
-size_t RM_GetClusterSize(void) {
-    if (!server.cluster_enabled) return 0;
-    return dictSize(server.cluster->nodes);
-}
-
-/* Populate the specified info for the node having as ID the specified 'id',
- * then returns REDISMODULE_OK. Otherwise if the node ID does not exist from
- * the POV of this local node, REDISMODULE_ERR is returned.
- *
- * The arguments ip, master_id, port and flags can be NULL in case we don't
- * need to populate back certain info. If an ip and master_id (only populated
- * if the instance is a slave) are specified, they point to buffers holding
- * at least REDISMODULE_NODE_ID_LEN bytes. The strings written back as ip
- * and master_id are not null terminated.
- *
- * The list of flags reported is the following:
- *
- * * REDISMODULE_NODE_MYSELF        This node
- * * REDISMODULE_NODE_MASTER        The node is a master
- * * REDISMODULE_NODE_SLAVE         The node is a replica
- * * REDISMODULE_NODE_PFAIL         We see the node as failing
- * * REDISMODULE_NODE_FAIL          The cluster agrees the node is failing
- * * REDISMODULE_NODE_NOFAILOVER    The slave is configured to never failover
- */
-
-clusterNode *clusterLookupNode(const char *name); /* We need access to internals */
-
-int RM_GetClusterNodeInfo(RedisModuleCtx *ctx, const char *id, char *ip, char *master_id, int *port, int *flags) {
-    UNUSED(ctx);
-
-    clusterNode *node = clusterLookupNode(id);
-    if (node == NULL ||
-        node->flags & (CLUSTER_NODE_NOADDR|CLUSTER_NODE_HANDSHAKE))
-    {
-        return REDISMODULE_ERR;
-    }
-
-    if (ip) strncpy(ip,node->ip,NET_IP_STR_LEN);
-
-    if (master_id) {
-        /* If the information is not available, the function will set the
-         * field to zero bytes, so that when the field can't be populated the
-         * function kinda remains predictable. */
-        if (node->flags & CLUSTER_NODE_MASTER && node->slaveof)
-            memcpy(master_id,node->slaveof->name,REDISMODULE_NODE_ID_LEN);
-        else
-            memset(master_id,0,REDISMODULE_NODE_ID_LEN);
-    }
-    if (port) *port = node->port;
-
-    /* As usually we have to remap flags for modules, in order to ensure
-     * we can provide binary compatibility. */
-    if (flags) {
-        *flags = 0;
-        if (node->flags & CLUSTER_NODE_MYSELF) *flags |= REDISMODULE_NODE_MYSELF;
-        if (node->flags & CLUSTER_NODE_MASTER) *flags |= REDISMODULE_NODE_MASTER;
-        if (node->flags & CLUSTER_NODE_SLAVE) *flags |= REDISMODULE_NODE_SLAVE;
-        if (node->flags & CLUSTER_NODE_PFAIL) *flags |= REDISMODULE_NODE_PFAIL;
-        if (node->flags & CLUSTER_NODE_FAIL) *flags |= REDISMODULE_NODE_FAIL;
-        if (node->flags & CLUSTER_NODE_NOFAILOVER) *flags |= REDISMODULE_NODE_NOFAILOVER;
-    }
-    return REDISMODULE_OK;
-}
-
-/* Set Redis Cluster flags in order to change the normal behavior of
- * Redis Cluster, especially with the goal of disabling certain functions.
- * This is useful for modules that use the Cluster API in order to create
- * a different distributed system, but still want to use the Redis Cluster
- * message bus. Flags that can be set:
- *
- *  CLUSTER_MODULE_FLAG_NO_FAILOVER
- *  CLUSTER_MODULE_FLAG_NO_REDIRECTION
- *
- * With the following effects:
- *
- *  NO_FAILOVER: prevent Redis Cluster slaves to failover a failing master.
- *               Also disables the replica migration feature.
- *
- *  NO_REDIRECTION: Every node will accept any key, without trying to perform
- *                  partitioning according to the user Redis Cluster algorithm.
- *                  Slots informations will still be propagated across the
- *                  cluster, but without effects. */
-void RM_SetClusterFlags(RedisModuleCtx *ctx, uint64_t flags) {
-    UNUSED(ctx);
-    if (flags & REDISMODULE_CLUSTER_FLAG_NO_FAILOVER)
-        server.cluster_module_flags |= CLUSTER_MODULE_FLAG_NO_FAILOVER;
-    if (flags & REDISMODULE_CLUSTER_FLAG_NO_REDIRECTION)
-        server.cluster_module_flags |= CLUSTER_MODULE_FLAG_NO_REDIRECTION;
 }
 
 /* --------------------------------------------------------------------------
@@ -8551,22 +8271,14 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(NotifyKeyspaceEvent);
     REGISTER_API(GetNotifyKeyspaceEvents);
     REGISTER_API(SubscribeToKeyspaceEvents);
-    REGISTER_API(RegisterClusterMessageReceiver);
-    REGISTER_API(SendClusterMessage);
-    REGISTER_API(GetClusterNodeInfo);
-    REGISTER_API(GetClusterNodesList);
-    REGISTER_API(FreeClusterNodesList);
     REGISTER_API(CreateTimer);
     REGISTER_API(StopTimer);
     REGISTER_API(GetTimerInfo);
-    REGISTER_API(GetMyClusterID);
-    REGISTER_API(GetClusterSize);
     REGISTER_API(GetRandomBytes);
     REGISTER_API(GetRandomHexChars);
     REGISTER_API(BlockedClientDisconnected);
     REGISTER_API(SetDisconnectCallback);
     REGISTER_API(GetBlockedClientHandle);
-    REGISTER_API(SetClusterFlags);
     REGISTER_API(CreateDict);
     REGISTER_API(FreeDict);
     REGISTER_API(DictSize);

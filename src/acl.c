@@ -1815,7 +1815,6 @@ void addACLLogEntry(client *c, int reason, int argpos, sds username) {
     }
 
     client *realclient = c;
-    if (realclient->flags & CLIENT_LUA) realclient = server.lua_caller;
 
     le->cinfo = catClientInfoString(sdsempty(),realclient);
     if (c->flags & CLIENT_MULTI) {

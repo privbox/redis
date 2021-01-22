@@ -57,7 +57,6 @@
 #include "dict.h"
 #include "adlist.h"
 #include "zmalloc.h"
-#include "linenoise.h"
 #include "help.h"
 #include "anet.h"
 #include "ae.h"

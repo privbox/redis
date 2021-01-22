@@ -481,12 +481,31 @@ int aeWait(int fd, int mask, long long milliseconds) {
     }
 }
 
-void aeMain(aeEventLoop *eventLoop) {
+int __aeMainIter(aeEventLoop *eventLoop) {
+    int iters = 0;
+    while (!eventLoop->stop && (iters++ < 10000))
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|
+                                    AE_CALL_BEFORE_SLEEP|
+                                    AE_CALL_AFTER_SLEEP);
+}
+#define UNUSED(x) (void)(x)
+
+void aeMainIter(aeEventLoop *eventLoop, int kerncall) {
+#ifdef KERNCALL
+    if (kerncall)
+        kerncall_spawn((uintptr_t)__aeMainIter, (unsigned long ) eventLoop);
+    else
+#endif
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|
+                                AE_CALL_BEFORE_SLEEP|
+                                AE_CALL_AFTER_SLEEP);
+    UNUSED(kerncall);
+}
+
+void aeMain(aeEventLoop *eventLoop, int kerncall) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {
-        aeProcessEvents(eventLoop, AE_ALL_EVENTS|
-                                   AE_CALL_BEFORE_SLEEP|
-                                   AE_CALL_AFTER_SLEEP);
+        aeMainIter(eventLoop, kerncall);
     }
 }
 

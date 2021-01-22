@@ -444,10 +444,7 @@ void punsubscribeCommand(client *c) {
 void publishCommand(client *c) {
     if (pubsubCheckACLPermissionsOrReply(c,1,1,0) != ACL_OK) return;
     int receivers = pubsubPublishMessage(c->argv[1],c->argv[2]);
-    if (server.cluster_enabled)
-        clusterPropagatePublish(c->argv[1],c->argv[2]);
-    else
-        forceCommandPropagation(c,PROPAGATE_REPL);
+    forceCommandPropagation(c,PROPAGATE_REPL);
     addReplyLongLong(c,receivers);
 }
 

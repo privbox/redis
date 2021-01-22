@@ -63,6 +63,10 @@
 #include <sys/mman.h>
 #endif
 
+#ifdef KERNCALL
+#include <sys/kerncall.h>
+#endif
+
 /* Our shared "common" objects */
 
 struct sharedObjectsStruct shared;
@@ -840,38 +844,6 @@ struct redisCommand redisCommandTable[] = {
      "no-script fast ok-loading ok-stale @transaction",
      0,NULL,0,0,0,0,0,0},
 
-    {"cluster",clusterCommand,-2,
-     "admin ok-stale random",
-     0,NULL,0,0,0,0,0,0},
-
-    {"restore",restoreCommand,-4,
-     "write use-memory @keyspace @dangerous",
-     0,NULL,1,1,1,0,0,0},
-
-    {"restore-asking",restoreCommand,-4,
-    "write use-memory cluster-asking @keyspace @dangerous",
-    0,NULL,1,1,1,0,0,0},
-
-    {"migrate",migrateCommand,-6,
-     "write random @keyspace @dangerous",
-     0,migrateGetKeys,0,0,0,0,0,0},
-
-    {"asking",askingCommand,1,
-     "fast @keyspace",
-     0,NULL,0,0,0,0,0,0},
-
-    {"readonly",readonlyCommand,1,
-     "fast @keyspace",
-     0,NULL,0,0,0,0,0,0},
-
-    {"readwrite",readwriteCommand,1,
-     "fast @keyspace",
-     0,NULL,0,0,0,0,0,0},
-
-    {"dump",dumpCommand,2,
-     "read-only random @keyspace",
-     0,NULL,1,1,1,0,0,0},
-
     {"object",objectCommand,-2,
      "read-only random @keyspace",
      0,NULL,2,2,1,0,0,0},
@@ -888,22 +860,8 @@ struct redisCommand redisCommandTable[] = {
      "no-auth no-script fast no-monitor ok-loading ok-stale no-slowlog @connection",
      0,NULL,0,0,0,0,0,0},
 
-    /* EVAL can modify the dataset, however it is not flagged as a write
-     * command since we do the check while running commands from Lua. */
-    {"eval",evalCommand,-3,
-     "no-script may-replicate @scripting",
-     0,evalGetKeys,0,0,0,0,0,0},
-
-    {"evalsha",evalShaCommand,-3,
-     "no-script may-replicate @scripting",
-     0,evalGetKeys,0,0,0,0,0,0},
-
     {"slowlog",slowlogCommand,-2,
      "admin random ok-loading ok-stale",
-     0,NULL,0,0,0,0,0,0},
-
-    {"script",scriptCommand,-2,
-     "no-script may-replicate @scripting",
      0,NULL,0,0,0,0,0,0},
 
     {"time",timeCommand,1,
@@ -1122,9 +1080,7 @@ void serverLogRaw(int level, const char *msg) {
         nolocks_localtime(&tm,tv.tv_sec,server.timezone,server.daylight_active);
         off = strftime(buf,sizeof(buf),"%d %b %Y %H:%M:%S.",&tm);
         snprintf(buf+off,sizeof(buf)-off,"%03d",(int)tv.tv_usec/1000);
-        if (server.sentinel_mode) {
-            role_char = 'X'; /* Sentinel. */
-        } else if (pid != server.pid) {
+        if (pid != server.pid) {
             role_char = 'C'; /* RDB / AOF writing child. */
         } else {
             role_char = (server.masterhost ? 'S':'M'); /* Slave or Master. */
@@ -1935,14 +1891,7 @@ void checkChildrenDone(void) {
             }
             if (!bysignal && exitcode == 0) receiveChildInfo();
             resetChildState();
-        } else {
-            if (!ldbRemoveChild(pid)) {
-                serverLog(LL_WARNING,
-                          "Warning, detected child with unmatched pid: %ld",
-                          (long) pid);
-            }
         }
-
         /* start any pending forks immediately. */
         replicationStartPendingFork();
     }
@@ -1970,11 +1919,7 @@ void cronUpdateMemoryStats() {
         /* in case the allocator isn't providing these stats, fake them so that
          * fragmentation info still shows some (inaccurate metrics) */
         if (!server.cron_malloc_stats.allocator_resident) {
-            /* LUA memory isn't part of zmalloc_used, but it is part of the process RSS,
-             * so we must deduct it in order to be able to calculate correct
-             * "allocator fragmentation" ratio */
-            size_t lua_memory = lua_gc(server.lua,LUA_GCCOUNT,0)*1024LL;
-            server.cron_malloc_stats.allocator_resident = server.cron_malloc_stats.process_rss - lua_memory;
+            server.cron_malloc_stats.allocator_resident = server.cron_malloc_stats.process_rss;
         }
         if (!server.cron_malloc_stats.allocator_active)
             server.cron_malloc_stats.allocator_active = server.cron_malloc_stats.allocator_resident;
@@ -2083,14 +2028,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Show information about connected clients */
-    if (!server.sentinel_mode) {
-        run_with_period(5000) {
-            serverLog(LL_DEBUG,
-                "%lu clients connected (%lu replicas), %zu bytes in use",
-                listLength(server.clients)-listLength(server.slaves),
-                listLength(server.slaves),
-                zmalloc_used_memory());
-        }
+    run_with_period(5000) {
+        serverLog(LL_DEBUG,
+            "%lu clients connected (%lu replicas), %zu bytes in use",
+            listLength(server.clients)-listLength(server.slaves),
+            listLength(server.slaves),
+            zmalloc_used_memory());
     }
 
     /* We need to do a few operations on clients asynchronously. */
@@ -2108,7 +2051,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
-    if (hasActiveChildProcess() || ldbPendingChildren())
+    if (hasActiveChildProcess())
     {
         run_with_period(1000) receiveChildInfo();
         checkChildrenDone();
@@ -2176,19 +2119,6 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* Replication cron function -- used to reconnect to master,
      * detect transfer failures, start background RDB transfers and so forth. */
     run_with_period(1000) replicationCron();
-
-    /* Run the Redis Cluster cron. */
-    run_with_period(100) {
-        if (server.cluster_enabled) clusterCron();
-    }
-
-    /* Run the Sentinel timer if we are in sentinel mode. */
-    if (server.sentinel_mode) sentinelTimer();
-
-    /* Cleanup expired MIGRATE cached sockets. */
-    run_with_period(1000) {
-        migrateCloseTimedoutSockets();
-    }
 
     /* Stop the I/O threads if we don't have enough pending work. */
     stopThreadedIOIfNeeded();
@@ -2339,12 +2269,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* If tls still has pending unread data don't sleep at all. */
     aeSetDontWait(server.el, tlsHasPendingData());
-
-    /* Call the Redis Cluster before sleep function. Note that this function
-     * may change the state of Redis Cluster (from ok to fail or vice versa),
-     * so it's a good idea to call it before serving the unblocked clients
-     * later in this function. */
-    if (server.cluster_enabled) clusterBeforeSleep();
 
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
@@ -2672,12 +2596,6 @@ void initServerConfig(void) {
 
     /* Debugging */
     server.watchdog_period = 0;
-
-    /* By default we want scripts to be always replicated by effects
-     * (single commands executed by the script), and not by sending the
-     * script to the slave / AOF. This is the new way starting from
-     * Redis 5. However it is possible to revert it via redis.conf. */
-    server.lua_always_replicate_commands = 1;
 
     initConfigValues();
 }
@@ -3231,9 +3149,7 @@ void initServer(void) {
         server.maxmemory_policy = MAXMEMORY_NO_EVICTION;
     }
 
-    if (server.cluster_enabled) clusterInit();
     replicationScriptCacheInit();
-    scriptingInit(1);
     slowlogInit();
     latencyMonitorInit();
 }
@@ -3244,6 +3160,10 @@ void initServer(void) {
  * Thread Local Storage initialization collides with dlopen call.
  * see: https://sourceware.org/bugzilla/show_bug.cgi?id=19329 */
 void InitServerLast() {
+#ifdef KERNCALL
+    if (server.use_kerncall)
+        kerncall_setup();
+#endif
     bioInit();
     initThreadedIO();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
@@ -3609,16 +3529,6 @@ void call(client *c, int flags) {
     if (server.loading && c->flags & CLIENT_LUA)
         flags &= ~(CMD_CALL_SLOWLOG | CMD_CALL_STATS);
 
-    /* If the caller is Lua, we want to force the EVAL caller to propagate
-     * the script if the command flag or client flag are forcing the
-     * propagation. */
-    if (c->flags & CLIENT_LUA && server.lua_caller) {
-        if (c->flags & CLIENT_FORCE_REPL)
-            server.lua_caller->flags |= CLIENT_FORCE_REPL;
-        if (c->flags & CLIENT_FORCE_AOF)
-            server.lua_caller->flags |= CLIENT_FORCE_AOF;
-    }
-
     /* Log the command into the Slow log if needed, and populate the
      * per-command statistics that we show in INFO commandstats. */
     if (flags & CMD_CALL_SLOWLOG && !(c->cmd->flags & CMD_SKIP_SLOWLOG)) {
@@ -3730,8 +3640,7 @@ void call(client *c, int flags) {
     /* If the client has keys tracking enabled for client side caching,
      * make sure to remember the keys it fetched via this command. */
     if (c->cmd->flags & CMD_READONLY) {
-        client *caller = (c->flags & CLIENT_LUA && server.lua_caller) ?
-                            server.lua_caller : c;
+        client *caller = c;
         if (caller->flags & CLIENT_TRACKING &&
             !(caller->flags & CLIENT_TRACKING_BCAST))
         {
@@ -3874,40 +3783,13 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* If cluster is enabled perform the cluster redirection here.
-     * However we don't perform the redirection if:
-     * 1) The sender of this command is our master.
-     * 2) The command has no key arguments. */
-    if (server.cluster_enabled &&
-        !(c->flags & CLIENT_MASTER) &&
-        !(c->flags & CLIENT_LUA &&
-          server.lua_caller->flags & CLIENT_MASTER) &&
-        !(!cmdHasMovableKeys(c->cmd) && c->cmd->firstkey == 0 &&
-          c->cmd->proc != execCommand))
-    {
-        int hashslot;
-        int error_code;
-        clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
-                                        &hashslot,&error_code);
-        if (n == NULL || n != server.cluster->myself) {
-            if (c->cmd->proc == execCommand) {
-                discardTransaction(c);
-            } else {
-                flagTransaction(c);
-            }
-            clusterRedirectClient(c,n,hashslot,error_code);
-            c->cmd->rejected_calls++;
-            return C_OK;
-        }
-    }
-
     /* Handle the maxmemory directive.
      *
      * Note that we do not want to reclaim memory if we are here re-entering
      * the event loop since there is a busy Lua script running in timeout
      * condition, to avoid mixing the propagation of scripts with the
      * propagation of DELs due to eviction. */
-    if (server.maxmemory && !server.lua_timedout) {
+    if (server.maxmemory) {
         int out_of_memory = (performEvictions() == EVICT_FAIL);
         /* performEvictions may flush slave output buffers. This may result
          * in a slave, that may be the active client, to be freed. */
@@ -3929,13 +3811,6 @@ int processCommand(client *c) {
         if (out_of_memory && reject_cmd_on_oom) {
             rejectCommand(c, shared.oomerr);
             return C_OK;
-        }
-
-        /* Save out_of_memory result at script start, otherwise if we check OOM
-         * until first write within script, memory used by lua stack and
-         * arguments might interfere. */
-        if (c->cmd->proc == evalCommand || c->cmd->proc == evalShaCommand) {
-            server.lua_oom = out_of_memory;
         }
     }
 
@@ -4015,31 +3890,6 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* Lua script too slow? Only allow a limited number of commands.
-     * Note that we need to allow the transactions commands, otherwise clients
-     * sending a transaction with pipelining without error checking, may have
-     * the MULTI plus a few initial commands refused, then the timeout
-     * condition resolves, and the bottom-half of the transaction gets
-     * executed, see Github PR #7022. */
-    if (server.lua_timedout &&
-          c->cmd->proc != authCommand &&
-          c->cmd->proc != helloCommand &&
-          c->cmd->proc != replconfCommand &&
-          c->cmd->proc != multiCommand &&
-          c->cmd->proc != discardCommand &&
-          c->cmd->proc != watchCommand &&
-          c->cmd->proc != unwatchCommand &&
-        !(c->cmd->proc == shutdownCommand &&
-          c->argc == 2 &&
-          tolower(((char*)c->argv[1]->ptr)[0]) == 'n') &&
-        !(c->cmd->proc == scriptCommand &&
-          c->argc == 2 &&
-          tolower(((char*)c->argv[1]->ptr)[0]) == 'k'))
-    {
-        rejectCommand(c, shared.slowscripterr);
-        return C_OK;
-    }
-
     /* If the server is paused, block the client until
      * the pause has ended. Replicas are never paused. */
     if (!(c->flags & CLIENT_SLAVE) && 
@@ -4106,7 +3956,7 @@ int prepareForShutdown(int flags) {
      * with half-read data).
      *
      * Also when in Sentinel mode clear the SAVE flag and force NOSAVE. */
-    if (server.loading || server.sentinel_mode)
+    if (server.loading)
         flags = (flags & ~SHUTDOWN_SAVE) | SHUTDOWN_NOSAVE;
 
     int save = flags & SHUTDOWN_SAVE;
@@ -4115,9 +3965,6 @@ int prepareForShutdown(int flags) {
     serverLog(LL_WARNING,"User requested shutdown...");
     if (server.supervised_mode == SUPERVISED_SYSTEMD)
         redisCommunicateSystemd("STOPPING=1\n");
-
-    /* Kill all the Lua debugger forked sessions. */
-    ldbKillForkedSessions();
 
     /* Kill the saving child if there is a background saving in progress.
        We want to avoid race conditions, for instance our saving child may
@@ -4196,8 +4043,7 @@ int prepareForShutdown(int flags) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
-    serverLog(LL_WARNING,"%s is now ready to exit, bye bye...",
-        server.sentinel_mode ? "Sentinel" : "Redis");
+    serverLog(LL_WARNING,"Redis is now ready to exit, bye bye...");
     return C_OK;
 }
 
@@ -4436,9 +4282,7 @@ sds genRedisInfoString(const char *section) {
         char *mode;
         char *supervised;
 
-        if (server.cluster_enabled) mode = "cluster";
-        else if (server.sentinel_mode) mode = "sentinel";
-        else mode = "standalone";
+        mode = "standalone";
 
         if (server.supervised) {
             if (server.supervised_mode == SUPERVISED_UPSTART) supervised = "upstart";
@@ -4528,7 +4372,7 @@ sds genRedisInfoString(const char *section) {
             "tracking_clients:%d\r\n"
             "clients_in_timeout_table:%llu\r\n",
             listLength(server.clients)-listLength(server.slaves),
-            getClusterConnectionsCount(),
+            0lu,
             server.maxclients,
             maxin, maxout,
             server.blocked_clients,
@@ -4548,7 +4392,7 @@ sds genRedisInfoString(const char *section) {
         size_t zmalloc_used = zmalloc_used_memory();
         size_t total_system_mem = server.system_memory_size;
         const char *evict_policy = evictPolicyToString();
-        long long memory_lua = server.lua ? (long long)lua_gc(server.lua,LUA_GCCOUNT,0)*1024 : 0;
+        long long memory_lua = 0;
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
         /* Peak memory is updated from time to time by serverCron() so it
@@ -4630,7 +4474,7 @@ sds genRedisInfoString(const char *section) {
             used_memory_lua_hmem,
             (long long) mh->lua_caches,
             used_memory_scripts_hmem,
-            dictSize(server.lua_scripts),
+            0lu,
             server.maxmemory,
             maxmemory_hmem,
             evict_policy,
@@ -5346,7 +5190,6 @@ void redisAsciiArt(void) {
     char *mode;
 
     if (server.cluster_enabled) mode = "cluster";
-    else if (server.sentinel_mode) mode = "sentinel";
     else mode = "standalone";
 
     /* Show the ASCII logo if: log file is stdout AND stdout is a
@@ -5602,7 +5445,6 @@ void redisSetProcTitle(char *title) {
 #ifdef USE_SETPROCTITLE
     char *server_mode = "";
     if (server.cluster_enabled) server_mode = " [cluster]";
-    else if (server.sentinel_mode) server_mode = " [sentinel]";
 
     setproctitle("%s %s:%d%s",
         title,
@@ -5705,6 +5547,17 @@ int iAmMaster(void) {
             (server.cluster_enabled && nodeIsMaster(server.cluster->myself)));
 }
 
+int __runServer(long arg) {
+    UNUSED(arg);
+    aeMain(server.el, server.use_kerncall);
+    aeDeleteEventLoop(server.el);
+    return 0;
+}
+
+void runServer(void) {
+    __runServer(0);
+}
+
 int main(int argc, char **argv) {
     struct timeval tv;
     int j;
@@ -5754,7 +5607,6 @@ int main(int argc, char **argv) {
     uint8_t hashseed[16];
     getRandomBytes(hashseed,sizeof(hashseed));
     dictSetHashFunctionSeed(hashseed);
-    server.sentinel_mode = checkForSentinelMode(argc,argv);
     initServerConfig();
     ACLInit(); /* The ACL subsystem must be initialized ASAP because the
                   basic networking code and client creation depends on it. */
@@ -5767,14 +5619,6 @@ int main(int argc, char **argv) {
     server.exec_argv = zmalloc(sizeof(char*)*(argc+1));
     server.exec_argv[argc] = NULL;
     for (j = 0; j < argc; j++) server.exec_argv[j] = zstrdup(argv[j]);
-
-    /* We need to init sentinel right now as parsing the configuration file
-     * in sentinel mode will have the effect of populating the sentinel
-     * data structures with master nodes to monitor. */
-    if (server.sentinel_mode) {
-        initSentinelConfig();
-        initSentinel();
-    }
 
     /* Check if we need to start in redis-check-rdb/aof mode. We just execute
      * the program main. However the program is part of the Redis executable
@@ -5837,11 +5681,6 @@ int main(int argc, char **argv) {
             j++;
         }
 
-        if (server.sentinel_mode && ! server.configfile) {
-            serverLog(LL_WARNING,
-                "Sentinel needs config file on disk to save state.  Exiting...");
-            exit(1);
-        }
         loadServerConfig(server.configfile, config_from_stdin, options);
         sdsfree(options);
     }
@@ -5860,7 +5699,7 @@ int main(int argc, char **argv) {
             (int)getpid());
 
     if (argc == 1) {
-        serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : "redis");
+        serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], "redis");
     } else {
         serverLog(LL_WARNING, "Configuration loaded");
     }
@@ -5872,53 +5711,35 @@ int main(int argc, char **argv) {
     redisAsciiArt();
     checkTcpBacklogSettings();
 
-    if (!server.sentinel_mode) {
-        /* Things not needed when running in Sentinel mode. */
-        serverLog(LL_WARNING,"Server initialized");
-    #ifdef __linux__
-        linuxMemoryWarnings();
-    #if defined (__arm64__)
-        if (linuxMadvFreeForkBugCheck()) {
-            serverLog(LL_WARNING,"WARNING Your kernel has a bug that could lead to data corruption during background save. Please upgrade to the latest stable kernel.");
-            if (!checkIgnoreWarning("ARM64-COW-BUG")) {
-                serverLog(LL_WARNING,"Redis will now exit to prevent data corruption. Note that it is possible to suppress this warning by setting the following config: ignore-warnings ARM64-COW-BUG");
-                exit(1);
-            }
+    /* Things not needed when running in Sentinel mode. */
+    serverLog(LL_WARNING,"Server initialized");
+#ifdef __linux__
+    linuxMemoryWarnings();
+#if defined (__arm64__)
+    if (linuxMadvFreeForkBugCheck()) {
+        serverLog(LL_WARNING,"WARNING Your kernel has a bug that could lead to data corruption during background save. Please upgrade to the latest stable kernel.");
+        if (!checkIgnoreWarning("ARM64-COW-BUG")) {
+            serverLog(LL_WARNING,"Redis will now exit to prevent data corruption. Note that it is possible to suppress this warning by setting the following config: ignore-warnings ARM64-COW-BUG");
+            exit(1);
         }
-    #endif /* __arm64__ */
-    #endif /* __linux__ */
-        moduleInitModulesSystemLast();
-        moduleLoadFromQueue();
-        ACLLoadUsersAtStartup();
-        InitServerLast();
-        loadDataFromDisk();
-        if (server.cluster_enabled) {
-            if (verifyClusterConfigWithData() == C_ERR) {
-                serverLog(LL_WARNING,
-                    "You can't have keys in a DB different than DB 0 when in "
-                    "Cluster mode. Exiting.");
-                exit(1);
-            }
-        }
-        if (server.ipfd_count > 0 || server.tlsfd_count > 0)
-            serverLog(LL_NOTICE,"Ready to accept connections");
-        if (server.sofd > 0)
-            serverLog(LL_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
-        if (server.supervised_mode == SUPERVISED_SYSTEMD) {
-            if (!server.masterhost) {
-                redisCommunicateSystemd("STATUS=Ready to accept connections\n");
-                redisCommunicateSystemd("READY=1\n");
-            } else {
-                redisCommunicateSystemd("STATUS=Waiting for MASTER <-> REPLICA sync\n");
-            }
-        }
-    } else {
-        ACLLoadUsersAtStartup();
-        InitServerLast();
-        sentinelIsRunning();
-        if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+    }
+#endif /* __arm64__ */
+#endif /* __linux__ */
+    moduleInitModulesSystemLast();
+    moduleLoadFromQueue();
+    ACLLoadUsersAtStartup();
+    InitServerLast();
+    loadDataFromDisk();
+    if (server.ipfd_count > 0 || server.tlsfd_count > 0)
+        serverLog(LL_NOTICE,"Ready to accept connections");
+    if (server.sofd > 0)
+        serverLog(LL_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
+    if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+        if (!server.masterhost) {
             redisCommunicateSystemd("STATUS=Ready to accept connections\n");
             redisCommunicateSystemd("READY=1\n");
+        } else {
+            redisCommunicateSystemd("STATUS=Waiting for MASTER <-> REPLICA sync\n");
         }
     }
 
@@ -5930,8 +5751,7 @@ int main(int argc, char **argv) {
     redisSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
-    aeMain(server.el);
-    aeDeleteEventLoop(server.el);
+    runServer();
     return 0;
 }
 

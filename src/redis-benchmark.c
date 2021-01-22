@@ -57,7 +57,6 @@
 #include "zmalloc.h"
 #include "atomicvar.h"
 #include "crc16_slottable.h"
-#include "hdr_histogram.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
 
@@ -1003,7 +1002,7 @@ static void benchmark(char *title, char *cmd, int len) {
     createMissingClients(c);
 
     config.start = mstime();
-    if (!config.num_threads) aeMain(config.el);
+    if (!config.num_threads) aeMain(config.el, 0);
     else startBenchmarkThreads();
     config.totlatency = mstime()-config.start;
 
@@ -1043,7 +1042,7 @@ static void freeBenchmarkThreads() {
 
 static void *execBenchmarkThread(void *ptr) {
     benchmarkThread *thread = (benchmarkThread *) ptr;
-    aeMain(thread->el);
+    aeMain(thread->el, 0);
     return NULL;
 }
 
@@ -1795,7 +1794,7 @@ int main(int argc, const char **argv) {
         c = createClient("",0,NULL,thread_id); /* will never receive a reply */
         createMissingClients(c);
         if (use_threads) startBenchmarkThreads();
-        else aeMain(config.el);
+        else aeMain(config.el, 0);
         /* and will wait for every */
     }
     if(config.csv){

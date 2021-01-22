@@ -66,13 +66,6 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
         serverLog(LL_VERBOSE,"Closing idle client");
         freeClient(c);
         return 1;
-    } else if (c->flags & CLIENT_BLOCKED) {
-        /* Cluster: handle unblock & redirect of clients blocked
-         * into keys no longer served by this server. */
-        if (server.cluster_enabled) {
-            if (clusterRedirectBlockedClientIfNeeded(c))
-                unblockClient(c);
-        }
     }
     return 0;
 }

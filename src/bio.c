@@ -61,6 +61,10 @@
 #include "server.h"
 #include "bio.h"
 
+#ifdef KERNCALL
+#include <sys/kerncall.h>
+#endif
+
 static pthread_t bio_threads[BIO_NUM_OPS];
 static pthread_mutex_t bio_mutex[BIO_NUM_OPS];
 static pthread_cond_t bio_newjob_cond[BIO_NUM_OPS];
@@ -164,10 +168,13 @@ void bioCreateFsyncJob(int fd) {
     bioSubmitJob(BIO_AOF_FSYNC, job);
 }
 
-void *bioProcessBackgroundJobs(void *arg) {
+void *__bioProcessBackgroundJobs(void *arg) {
     struct bio_job *job;
     unsigned long type = (unsigned long) arg;
     sigset_t sigset;
+    unsigned long cs;
+    __asm__ ("mov %%cs, %0" : "=r"(cs));
+    serverLog(LL_NOTICE, "in __bioProcessBackgroundJobs, cs %lx", cs);
 
     /* Check that the type is within the right interval. */
     if (type >= BIO_NUM_OPS) {
@@ -237,6 +244,10 @@ void *bioProcessBackgroundJobs(void *arg) {
         /* Unblock threads blocked on bioWaitStepOfType() if any. */
         pthread_cond_broadcast(&bio_step_cond[type]);
     }
+}
+
+void *bioProcessBackgroundJobs(void *arg)  {
+    return __bioProcessBackgroundJobs(arg);
 }
 
 /* Return the number of pending jobs of the specified type. */
