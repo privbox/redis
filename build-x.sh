@@ -9,4 +9,4 @@ make \
     LDFLAGS="-static" \
     -j${NPROC} $@
 mkdir -p  $DESTDIR
-cp src/redis-server src/redis-benchmark $DESTDIR/
+cp src/redis-server $DESTDIR/
